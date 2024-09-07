@@ -1,0 +1,227 @@
+"""
+ Apriori algorithm implementation 
+"""
+
+import json
+import csv
+from collections import namedtuple
+from itertools import combinations
+from concurrent.futures import ThreadPoolExecutor
+from io import StringIO
+
+# Meta information.
+__version__ = '1.2.0'
+__author__ = 'Yu Mochizuki (Modified by keerthika)'
+__author_email__ = 'ymoch.dev@gmail.com'
+
+
+################################################################################
+# Data structures.
+################################################################################
+class TransactionManager:
+    def __init__(self, transactions):
+        self.__num_transaction = 0
+        self.__items = []
+        self.__transaction_index_map = {}
+
+        for transaction in transactions:
+            self.add_transaction(transaction)
+
+    def add_transaction(self, transaction):
+        for item in transaction:
+            if item not in self.__transaction_index_map:
+                self.__items.append(item)
+                self.__transaction_index_map[item] = set()
+            self.__transaction_index_map[item].add(self.__num_transaction)
+        self.__num_transaction += 1
+
+    def calc_support(self, items):
+        if not items:
+            return 1.0
+        if not self.num_transaction:
+            return 0.0
+        sum_indexes = None
+        for item in items:
+            indexes = self.__transaction_index_map.get(item)
+            if indexes is None:
+                return 0.0
+            if sum_indexes is None:
+                sum_indexes = indexes
+            else:
+                sum_indexes = sum_indexes.intersection(indexes)
+        return float(len(sum_indexes)) / self.__num_transaction
+
+    def initial_candidates(self):
+        return [frozenset([item]) for item in self.items]
+
+    @property
+    def num_transaction(self):
+        return self.__num_transaction
+
+    @property
+    def items(self):
+        return sorted(self.__items)
+
+    @staticmethod
+    def create(transactions):
+        if isinstance(transactions, TransactionManager):
+            return transactions
+        return TransactionManager(transactions)
+
+
+SupportRecord = namedtuple('SupportRecord', ('items', 'support'))
+RelationRecord = namedtuple('RelationRecord', SupportRecord._fields + ('ordered_statistics',))
+OrderedStatistic = namedtuple('OrderedStatistic', ('items_base', 'items_add', 'confidence', 'lift'))
+
+
+################################################################################
+# Inner functions.
+################################################################################
+def create_next_candidates(prev_candidates, length):
+    item_set = set()
+    for candidate in prev_candidates:
+        for item in candidate:
+            item_set.add(item)
+    items = sorted(item_set)
+    tmp_next_candidates = (frozenset(x) for x in combinations(items, length))
+    if length < 3:
+        return list(tmp_next_candidates)
+    next_candidates = [
+        candidate for candidate in tmp_next_candidates
+        if all(frozenset(x) in prev_candidates for x in combinations(candidate, length - 1))
+    ]
+    return next_candidates
+
+
+def gen_support_records(transaction_manager, min_support, **kwargs):
+    max_length = kwargs.get('max_length')
+    _create_next_candidates = kwargs.get('_create_next_candidates', create_next_candidates)
+
+    candidates = transaction_manager.initial_candidates()
+    length = 1
+    while candidates:
+        relations = set()
+        with ThreadPoolExecutor() as executor:
+            future_to_relation = {executor.submit(transaction_manager.calc_support, relation_candidate): relation_candidate for relation_candidate in candidates}
+            for future in future_to_relation:
+                support = future.result()
+                relation_candidate = future_to_relation[future]
+                if support >= min_support:
+                    candidate_set = frozenset(relation_candidate)
+                    relations.add(candidate_set)
+                    yield SupportRecord(candidate_set, support)
+        length += 1
+        if max_length and length > max_length:
+            break
+        candidates = _create_next_candidates(relations, length)
+
+
+def gen_ordered_statistics(transaction_manager, record):
+    items = record.items
+    for combination_set in combinations(sorted(items), len(items) - 1):
+        items_base = frozenset(combination_set)
+        items_add = frozenset(items.difference(items_base))
+        confidence = record.support / transaction_manager.calc_support(items_base)
+        lift = confidence / transaction_manager.calc_support(items_add)
+        yield OrderedStatistic(items_base, items_add, confidence, lift)
+
+
+def filter_ordered_statistics(ordered_statistics, **kwargs):
+    min_confidence = kwargs.get('min_confidence', 0.0)
+    min_lift = kwargs.get('min_lift', 0.0)
+
+    for ordered_statistic in ordered_statistics:
+        if ordered_statistic.confidence >= min_confidence and ordered_statistic.lift >= min_lift:
+            yield ordered_statistic
+
+
+################################################################################
+# API function.
+################################################################################
+def apriori(transactions, **kwargs):
+    min_support = kwargs.get('min_support', 0.1)
+    min_confidence = kwargs.get('min_confidence', 0.0)
+    min_lift = kwargs.get('min_lift', 0.0)
+    max_length = kwargs.get('max_length', None)
+    rule_generation = kwargs.get('generate_rules', True)
+
+    if min_support <= 0:
+        raise ValueError('Minimum support must be > 0')
+
+    transaction_manager = TransactionManager.create(transactions)
+    support_records = gen_support_records(transaction_manager, min_support, max_length=max_length)
+
+    for support_record in support_records:
+        if rule_generation:
+            ordered_statistics = list(
+                filter_ordered_statistics(
+                    gen_ordered_statistics(transaction_manager, support_record),
+                    min_confidence=min_confidence, min_lift=min_lift))
+            if ordered_statistics:
+                yield RelationRecord(support_record.items, support_record.support, ordered_statistics)
+        else:
+            yield SupportRecord(support_record.items, support_record.support)
+
+
+################################################################################
+# Output format functions
+################################################################################
+def dump_as_json(result):
+    """
+    Dumps the result as JSON.
+    """
+    return json.dumps([record._asdict() for record in result], indent=2)
+
+
+def dump_as_two_item_tsv(result):
+    """
+    Dumps the result as TSV (two items per row).
+    """
+    output = StringIO()
+    writer = csv.writer(output, delimiter='\t')
+    for record in result:
+        for ordered_stat in record.ordered_statistics:
+            writer.writerow([
+                ','.join(record.items),
+                ','.join(ordered_stat.items_base),
+                ','.join(ordered_stat.items_add),
+                ordered_stat.confidence,
+                ordered_stat.lift
+            ])
+    return output.getvalue().strip()
+
+
+################################################################################
+# Main function: Direct input and output
+################################################################################
+def main():
+    # Example predefined input transactions
+    transactions = [
+        ['milk', 'bread', 'butter'],
+        ['beer', 'bread', 'butter'],
+        ['milk', 'beer', 'bread'],
+        ['milk', 'bread'],
+        ['milk', 'beer'],
+    ]
+
+    # Parameters
+    min_support = 0.2
+    min_confidence = 0.5
+    min_lift = 1.0
+    max_length = None
+    generate_rules = True
+
+    # Run Apriori
+    results = list(apriori(transactions, min_support=min_support, min_confidence=min_confidence, min_lift=min_lift, max_length=max_length, generate_rules=generate_rules))
+
+    # Output in JSON format
+    json_output = dump_as_json(results)
+    print("JSON Output:\n", json_output)
+
+    # Output in TSV format
+    tsv_output = dump_as_two_item_tsv(results)
+    print("TSV Output:\n", tsv_output)
+
+
+if __name__ == '__main__':
+    main()
